@@ -92,6 +92,18 @@ class ObservationGroupCfg:
   """Group-level history length override. If set, applies to all terms in
   this group. If None, each term uses its own ``history_length`` setting."""
 
+  history_ordering: Literal["term", "time"] = "term"
+  """History layout when a group concatenates several terms.
+
+  - ``"term"``: each term's history is flattened, then terms are joined:
+    ``[A_t0, A_t1, ..., B_t0, B_t1, ...]``
+  - ``"time"``: at each step the terms are joined, then steps are joined:
+    ``[A_t0, B_t0, ..., A_t1, B_t1, ...]``
+
+  ``"time"`` returns a flat ``(num_envs, history * feature)`` tensor. One term
+  is unchanged because there is nothing to interleave.
+  """
+
   flatten_history_dim: bool = True
   """Whether to flatten history into the observation dimension. If True,
   observations have shape ``(num_envs, obs_dim * history_length)``. If False,
@@ -196,6 +208,34 @@ class ObservationManager(ManagerBase):
       idx = 0
       data = obs_buffer[group_name]
       assert isinstance(data, torch.Tensor)
+      group_cfg = self.cfg[group_name]
+      if group_cfg.history_ordering == "time":
+        names = self._group_obs_term_names[group_name]
+        shapes = self._group_obs_term_dim[group_name]
+        cfgs = self._group_obs_term_cfgs[group_name]
+        widths: list[int] = []
+        history = 0
+        for shape, term_cfg in zip(shapes, cfgs, strict=False):
+          size = int(np.prod(shape))
+          if term_cfg.history_length > 0:
+            history = term_cfg.history_length
+            widths.append(size // term_cfg.history_length)
+          else:
+            widths.append(size)
+        frame = sum(widths)
+        offset = 0
+        for name, term_cfg, width in zip(names, cfgs, widths, strict=False):
+          if history > 0 and term_cfg.history_length > 0:
+            parts = [
+              data[env_idx, t * frame + offset : t * frame + offset + width]
+              for t in range(history)
+            ]
+            values = torch.cat(parts).cpu().tolist()
+          else:
+            values = data[env_idx, offset : offset + width].cpu().tolist()
+          terms.append((group_name + "-" + name, values))
+          offset += width
+        continue
       for name, shape in zip(
         self._group_obs_term_names[group_name],
         self._group_obs_term_dim[group_name],
@@ -377,7 +417,7 @@ class ObservationManager(ManagerBase):
         else:
           circular_buffer.backfill(obs, env_ids)
 
-        if term_cfg.flatten_history_dim:
+        if term_cfg.flatten_history_dim and group_cfg.history_ordering != "time":
           group_obs[term_name] = circular_buffer.buffer.reshape(self._env.num_envs, -1)
         else:
           group_obs[term_name] = circular_buffer.buffer
@@ -401,6 +441,8 @@ class ObservationManager(ManagerBase):
       result = torch.cat(
         list(group_obs.values()), dim=self._group_obs_concatenate_dim[group_name]
       )
+      if result.dim() == 3 and group_cfg.history_ordering == "time":
+        result = result.reshape(result.shape[0], -1)
       # Final check for concatenated result (non-per-term checking).
       if not group_cfg.nan_check_per_term and group_cfg.nan_policy != "disabled":
         result = self._check_and_handle_nans(
@@ -506,7 +548,7 @@ class ObservationManager(ManagerBase):
           old_dims = list(obs_dims)
           old_dims.insert(1, term_cfg.history_length)
           obs_dims = tuple(old_dims)
-          if term_cfg.flatten_history_dim:
+          if term_cfg.flatten_history_dim or group_cfg.history_ordering == "time":
             obs_dims = (obs_dims[0], int(np.prod(obs_dims[1:])))
 
         self._group_obs_term_dim[group_name].append(obs_dims[1:])
