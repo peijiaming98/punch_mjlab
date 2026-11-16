@@ -196,17 +196,19 @@ class UniformVelocityCommand(CommandTerm):
       enabled = server.gui.add_checkbox("Enable", initial_value=False)
 
       for label, max_val in axes:
+        # 速度上限为 0 的轴保持锁定。范围滑块的初始值不能是 0。
+        axis_limit = max(float(max_val), 0.0)
         max_input = server.gui.add_slider(
           f"Max {label}",
-          initial_value=max_val,
+          initial_value=max(axis_limit, 0.1),
           step=0.1,
           min=0.1,
           max=10.0,
         )
         slider = server.gui.add_slider(
           label,
-          min=-max_val,
-          max=max_val,
+          min=-axis_limit,
+          max=axis_limit,
           step=0.05,
           initial_value=0.0,
         )
